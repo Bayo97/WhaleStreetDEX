@@ -1,72 +1,88 @@
-# scanner.py
-symbol = p.get("symbol") or p.get("name") or "UNKNOWN"
-try:
-vol24 = float(p.get("volume24h") or p.get("volume") or 0)
-except:
-vol24 = 0
-try:
-avg24 = float(p.get("averageVolume24h") or p.get("avgVolume24h") or 0)
-except:
-avg24 = 0
-try:
-price_change_24h = float(p.get("priceChange") or p.get("priceChange24h") or 0)
-except:
-price_change_24h = 0
+import requests
+import time
+from datetime import datetime, timedelta
+from filters import is_probable_honeypot
+
+# ==============================
+# GLOBALS
+# ==============================
+start_time = time.time()
+total_alerts = 0
+today_alerts = 0
+hour_alerts = 0
+last_alerts = []
+seen_alerts = set()
+
+# ==============================
+# HELPERS
+# ==============================
+def format_uptime(sec):
+    return str(timedelta(seconds=int(sec))).split('.')[0]
+
+def get_stats():
+    return {
+        "uptime": format_uptime(time.time() - start_time),
+        "total_alerts": total_alerts,
+        "today_alerts": today_alerts,
+        "hour_alerts": hour_alerts
+    }
+
+def get_last_alerts():
+    return last_alerts[-10:]
 
 
-ratio = (vol24 / avg24) if avg24 > 0 else (vol24 / 1 if vol24 > 0 else 0)
-
-
-# must be on monitored chain
-if chain not in [c.lower() for c in CHAINS]:
-return None
-
-
-# basic thresholds
-if vol24 < MIN_VOLUME_24H:
-return None
-if ratio < VOLUME_SPIKE_RATIO:
-return None
-if abs(price_change_24h) < PRICE_CHANGE_THRESHOLD:
-return None
-
-
-# honeypot / scam heuristics (especially for Solana) — if flagged, skip
-address = p.get("address") or p.get("tokenAddress") or None
-if chain == 'solana' and address:
-try:
-if is_probable_honeypot(address):
-logger.info("Filtered probable honeypot: %s (%s)", symbol, address)
-return None
-except Exception as e:
-logger.exception("Honeypot check error: %s", e)
-
-
-return {
-"symbol": symbol,
-"chain": chain,
-"ratio": ratio,
-"vol24": vol24,
-"price_change_24h": price_change_24h,
-"address": address
-}
-
-
-# run one scan and return list of alerts
-
-
+# ==============================
+# SCAN FUNCTION
+# ==============================
 def run_scan_once():
-global _total_alerts, _today_alerts, _hour_alerts
-profiles = fetch_profiles()
-alerts = []
-now = _now_ts()
+    """
+    Pobiera listę tokenów z DEX Solana/Base
+    Sprawdza wolumeny i zmiany ceny
+    Filtrowanie honeypotów
+    Zwraca listę nowych alertów
+    """
+    global total_alerts, today_alerts, hour_alerts
 
+    # przykładowe źródło DEX Screener API (Solana/Base)
+    urls = [
+        "https://api.dexscreener.com/latest/dex/tokens/solana",
+        "https://api.dexscreener.com/latest/dex/tokens/base"
+    ]
 
-# simple rate limiter for alerts per minute
-# count alerts in last 60s
-recent_alerts = [t for t in _last_alerts if isinstance(t, str) and t]
-# we keep time in entries? to allow simple rate limiting we will use _seen times
-last_min_count = len([1 for ts in _seen.values() if now - ts <= 60])
-for p in profiles:
-try:
-info = _detect_profile(p)
+    new_alerts = []
+
+    for url in urls:
+        try:
+            resp = requests.get(url, timeout=10).json()
+            pairs = resp.get("pairs", [])
+        except Exception:
+            continue
+
+        for p in pairs:
+            try:
+                base = p.get("baseToken", {}).get("symbol")
+                price_now = float(p.get("priceUsd") or 0)
+                vol24 = float(p.get("volume24h") or p.get("volume") or 0)
+
+                if not base or vol24 == 0:
+                    continue
+
+                # prosty filtr pumpy
+                price_change = float(p.get("priceChangePercent") or 0)
+                if vol24 > 100_000 and price_change > 5 and not is_probable_honeypot(p):
+                    if base in seen_alerts:
+                        continue
+                    seen_alerts.add(base)
+
+                    msg = f"{base} | Vol24: {vol24:.0f} USD | ΔPrice: {price_change:.1f}%\nhttps://dexscreener.com/search?q={base}"
+                    new_alerts.append(msg)
+
+                    total_alerts += 1
+                    today_alerts += 1
+                    hour_alerts += 1
+                    last_alerts.append(f"{datetime.now().strftime('%H:%M')} | {base} | Vol24: {vol24:.0f} | ΔPrice: {price_change:.1f}%")
+
+            except Exception:
+                continue
+
+    return new_alerts
