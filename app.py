@@ -1,87 +1,158 @@
-# app.py
-f"Uptime: {stats['uptime']}\n"
-f"Total alerts: {stats['total_alerts']}\n"
-f"Today alerts: {stats['today_alerts']}\n"
-f"Hour alerts: {stats['hour_alerts']}\n"
+import os
+import time
+import logging
+from datetime import datetime, timedelta
+from flask import Flask, request, jsonify, abort
+import requests
+
+from scanner import run_scan_once, get_stats, get_last_alerts
+from filters import is_probable_honeypot
+
+# ==============================
+# ENV CONFIG
+# ==============================
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+CHAT_ID = int(os.environ.get("CHAT_ID", "0"))
+TRIGGER_SECRET = os.environ.get("TRIGGER_SECRET", "secret123")
+
+PORT = int(os.environ.get("PORT", 8080))
+
+WEBHOOK_PATH = os.environ.get(
+    "WEBHOOK_PATH",
+    f"/webhook/{TELEGRAM_TOKEN[-18:] if TELEGRAM_TOKEN else 'token'}"
 )
-send_telegram(text, chat_id)
-elif cmd == "/top":
-last = get_last_alerts()
-if not last:
-send_telegram("Brak alertów jeszcze.", chat_id)
-else:
-send_telegram("Ostatnie alerty:\n\n" + "\n".join(last), chat_id)
-else:
-send_telegram("Nieznana komenda. Użyj /help.", chat_id)
+
+HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", 3600))
+
+# ==============================
+# LOGGING
+# ==============================
+os.makedirs("logs", exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("logs/dex.log"),
+        logging.StreamHandler()
+    ]
+)
+
+logger = logging.getLogger("dex-scanner")
+
+# ==============================
+# FLASK APP
+# ==============================
+app = Flask(__name__)
 
 
-# -------- webhook endpoint for Telegram --------
+# ==============================
+# TELEGRAM SENDER
+# ==============================
+def send_telegram(text, chat_id=CHAT_ID):
+    if not TELEGRAM_TOKEN:
+        logger.warning("No TELEGRAM_TOKEN provided.")
+        return
+
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data={
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True
+            },
+            timeout=10
+        )
+    except Exception as e:
+        logger.error(f"Telegram send error: {e}")
 
 
+# ==============================
+# TELEGRAM COMMAND HANDLER
+# ==============================
+def handle_command(text, chat_id):
+    t = text.lower().strip()
+
+    if t in ["/start", "/help"]:
+        msg = (
+            "DEX Scanner (Solana + Base)\n\n"
+            "Dostępne komendy:\n"
+            "/start — opis\n"
+            "/help — pomoc\n"
+            "/stats — statystyki bota\n"
+            "/top — ostatnie alerty\n"
+        )
+        send_telegram(msg, chat_id)
+        return
+
+    if t == "/stats":
+        s = get_stats()
+        msg = (
+            f"Uptime: {s['uptime']}\n"
+            f"Total alerts: {s['total_alerts']}\n"
+            f"Today: {s['today_alerts']}\n"
+            f"Last hour: {s['hour_alerts']}\n"
+        )
+        send_telegram(msg, chat_id)
+        return
+
+    if t == "/top":
+        arr = get_last_alerts()
+        if not arr:
+            send_telegram("Brak alertów.", chat_id)
+            return
+
+        send_telegram("Ostatnie alerty:\n\n" + "\n".join(arr), chat_id)
+        return
+
+
+# ==============================
+# WEBHOOK ENDPOINT
+# ==============================
 @app.route(WEBHOOK_PATH, methods=["POST"])
 def telegram_webhook():
-"""Telegram will POST updates here."""
-try:
-data = request.get_json(force=True)
-logger.info("Received update: %s", data.get('update_id'))
-# handle messages only
-if "message" in data:
-msg = data["message"]
-chat_id = msg["chat"]["id"]
-text = msg.get("text", "")
-if text and text.startswith("/"):
-handle_command(text.split()[0], chat_id)
-else:
-send_telegram("Bot obsługuje tylko komendy. Użyj /help.", chat_id)
-return jsonify({"ok": True})
-except Exception as e:
-logger.exception("Error in webhook: %s", e)
-return jsonify({"ok": False, "error": str(e)}), 500
+    data = request.json
+
+    if not data or "message" not in data:
+        return jsonify({"ok": True})
+
+    msg = data["message"]
+    chat_id = msg["chat"]["id"]
+    text = msg.get("text", "")
+
+    if text.startswith("/"):
+        handle_command(text, chat_id)
+
+    return jsonify({"ok": True})
 
 
-# -------- manual trigger endpoint (protected by TRIGGER_SECRET) --------
-
-
+# ==============================
+# MANUAL SCAN TRIGGER
+# ==============================
 @app.route("/trigger_scan", methods=["POST"])
 def trigger_scan():
-secret = request.headers.get("X-TRIGGER-SECRET") or request.args.get("secret")
-if not TRIGGER_SECRET:
-logger.warning("TRIGGER_SECRET not set — rejecting manual trigger")
-abort(403)
-if not secret or secret != TRIGGER_SECRET:
-abort(403)
-# run a scan synchronously and return result
-logger.info("Manual scan triggered")
-alerts = run_scan_once()
-return jsonify({"status": "ok", "alerts": alerts})
+    secret = request.headers.get("X-TRIGGER-SECRET") or request.args.get("secret")
+
+    if secret != TRIGGER_SECRET:
+        abort(403)
+
+    found = run_scan_once()
+    return jsonify({"ok": True, "found": found})
 
 
-# -------- health and misc endpoints --------
-
-
+# ==============================
+# HEALTH CHECK
+# ==============================
 @app.route("/health")
 def health():
-stats = get_stats()
-return jsonify({"status": "ok", "stats": stats})
+    return jsonify({"status": "ok", "time": time.time()})
 
 
-# -------- heartbeat thread (periodic message to admin chat) --------
-
-
-def heartbeat_loop():
-while True:
-try:
-send_telegram(f"DEX Scanner alive — uptime {get_stats()['uptime']}")
-except Exception as e:
-logger.exception("Heartbeat error: %s", e)
-time.sleep(HEARTBEAT_INTERVAL)
-
-
+# ==============================
+# RUN SERVER
+# ==============================
 if __name__ == "__main__":
-# start heartbeat thread
-if TELEGRAM_TOKEN and CHAT_ID and os.environ.get("ENABLE_HEARTBEAT", "1") == "1":
-t_hb = threading.Thread(target=heartbeat_loop, daemon=True)
-t_hb.start()
-# start Flask
-logger.info("Starting app on port %s — webhook path: %s", PORT, WEBHOOK_PATH)
-app.run(host="0.0.0.0", port=PORT)
+    logger.info(f"Starting DEX scanner on port {PORT}")
+    app.run(host="0.0.0.0", port=PORT)
